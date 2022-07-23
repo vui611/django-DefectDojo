@@ -1,0 +1,180 @@
+FROM debian:stretch AS libpqbuilder
+
+RUN apt-get update && apt-get -y install curl ca-certificates gnupg dpkg-dev devscripts
+RUN curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null
+RUN echo "deb-src http://apt.postgresql.org/pub/repos/apt/ stretch-pgdg main" >> /etc/apt/sources.list.d/pgdg.list
+
+# get source packages
+RUN cd ~ && apt-get update && apt-get source pgdg-keyring postgresql-common postgresql-14
+
+# disable running the postgres test suite after building
+ENV DEB_BUILD_OPTIONS=nocheck
+
+# build deps for building postgres
+RUN cd ~/pgdg-* && mk-build-deps -ir -t "apt-get -o Debug::pkgProblemResolver=yes -y --no-install-recommends"
+RUN cd ~/pgdg-* && debuild -i -us -uc -b
+RUN cd ~/postgresql-common-* && mk-build-deps -ir -t "apt-get -o Debug::pkgProblemResolver=yes -y --no-install-recommends"
+RUN cd ~/postgresql-common-* && debuild -i -us -uc -b
+
+# install deps
+RUN apt install -y ~/pgdg-keyring_*.deb
+RUN apt install -y ~/postgresql-client-common_*.deb
+RUN apt install -y ~/postgresql-common_*.deb
+
+# build postgres
+RUN cd ~/postgresql-14-14.* && mk-build-deps -ir -t "apt-get -o Debug::pkgProblemResolver=yes -y --no-install-recommends"
+RUN cd ~/postgresql-14-14.* && debuild -i -us -uc -b
+
+RUN mkdir /out && mv ~/libpq-dev_*.deb /out/ && mv ~/libpq5_*.deb /out/
+RUN ls -alh /out
+
+
+# code: language=Dockerfile
+
+# The code for the build image should be identical with the code in
+# Dockerfile.nginx to use the caching mechanism of Docker.
+
+# Ref: https://devguide.python.org/#branchstatus
+FROM python:3.8.13-bullseye as base 
+FROM base as build
+WORKDIR /app
+RUN \
+  apt-get -y update && \
+  apt-get -y install --no-install-recommends \
+    gcc \
+    build-essential \
+    libssl-dev libldap-2.4-2 \
+    dnsutils \
+    default-mysql-client \
+    libmariadb-dev-compat \
+    postgresql-client \
+    xmlsec1 \
+    git \
+    uuid-runtime \
+    && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists && \
+  true
+
+
+COPY --from=libpqbuilder /out/libpq-dev_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/
+COPY --from=libpqbuilder /out/libpq5_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/
+# install libpq
+RUN dpkg -i /var/cache/apt/archives/libpq-dev_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/libpq5_14.4-1.pgdg90+1_arm64.deb
+RUN pip install psycopg2==2.9.3
+
+COPY requirements.arm64.txt ./
+# CPUCOUNT=1 is needed, otherwise the wheel for uwsgi won't always be build succesfully
+# https://github.com/unbit/uwsgi/issues/1318#issuecomment-542238096
+RUN CPUCOUNT=1 pip3 wheel --wheel-dir=/tmp/wheels -r ./requirements.arm64.txt
+
+FROM base as django
+WORKDIR /app
+ARG uid=1001
+ARG gid=1337
+ARG appuser=defectdojo
+ENV appuser ${appuser}
+RUN \
+  apt-get -y update && \
+  # ugly fix to install postgresql-client without errors
+  mkdir -p /usr/share/man/man1 /usr/share/man/man7 && \
+  apt-get -y install --no-install-recommends \
+    # libopenjp2-7 libjpeg62 libtiff5 are required by the pillow package
+    libopenjp2-7 \
+    libjpeg62 \
+    libtiff5 \
+    dnsutils \
+    default-mysql-client \
+    libmariadb3 \
+    xmlsec1 \
+    git \
+    uuid-runtime \
+    # only required for the dbshell (used by the initializer job)
+    postgresql-client \
+    && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists && \
+  true
+
+COPY --from=libpqbuilder /out/libpq-dev_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/
+COPY --from=libpqbuilder /out/libpq5_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/
+# install libpq
+RUN dpkg -i /var/cache/apt/archives/libpq-dev_14.4-1.pgdg90+1_arm64.deb /var/cache/apt/archives/libpq5_14.4-1.pgdg90+1_arm64.deb
+RUN pip install psycopg2==2.9.3
+
+COPY requirements.arm64.txt ./
+
+COPY --from=build /tmp/wheels /tmp/wheels
+COPY requirements.arm64.txt ./
+RUN pip3 install \
+	--no-cache-dir \
+	--no-index \
+  --find-links=/tmp/wheels \
+  -r ./requirements.arm64.txt
+
+COPY \
+  docker/entrypoint-celery-beat.sh \
+  docker/entrypoint-celery-worker.sh \
+  docker/entrypoint-initializer.sh \
+  docker/entrypoint-uwsgi.sh \
+  docker/entrypoint-uwsgi-dev.sh \
+  docker/entrypoint-unit-tests.sh \
+  docker/entrypoint-unit-tests-devDocker.sh \
+  docker/wait-for-it.sh \
+  docker/certs/* \
+  /
+COPY wsgi.py manage.py docker/unit-tests.sh ./
+COPY dojo/ ./dojo/
+
+# Add extra fixtures to docker image which are loaded by the initializer
+COPY docker/extra_fixtures/* /app/dojo/fixtures/
+
+COPY tests/ ./tests/
+RUN \
+  # Remove placeholder copied from docker/certs
+  rm -f /readme.txt && \
+  # Remove placeholder copied from docker/extra_fixtures
+  rm -f dojo/fixtures/readme.txt && \
+  mkdir -p dojo/migrations && \
+  chmod g=u dojo/migrations && \
+  true
+USER root
+RUN \
+    addgroup --gid ${gid} ${appuser} && \
+    adduser --system --no-create-home --disabled-password --gecos '' \
+        --uid ${uid} --gid ${gid} ${appuser} && \
+    chown -R root:root /app && \
+    chmod -R u+rwX,go+rX,go-w /app && \
+    # Allow for bind mounting local_settings.py and other setting overrides
+    chown -R root:${appuser} /app/dojo/settings && \
+    chmod -R 775 /app/dojo/settings && \
+    mkdir /var/run/${appuser} && \
+    chown ${appuser} /var/run/${appuser} && \
+	  chmod g=u /var/run/${appuser} && \
+    mkdir -p media/threat && chown -R ${uid} media
+USER ${uid}
+ENV \
+  # Only variables that are not defined in settings.dist.py
+  DD_ADMIN_USER=admin \
+  DD_ADMIN_MAIL=admin@defectdojo.local \
+  DD_ADMIN_PASSWORD='' \
+  DD_ADMIN_FIRST_NAME=Admin \
+  DD_ADMIN_LAST_NAME=User \
+  DD_CELERY_LOG_LEVEL="INFO" \
+  DD_CELERY_WORKER_POOL_TYPE="solo" \
+  # Enable prefork and options below to ramp-up celeryworker performance. Presets should work fine for a machine with 8GB of RAM, while still leaving room.
+  # See https://docs.celeryproject.org/en/stable/userguide/workers.html#id12 for more details
+  # DD_CELERY_WORKER_POOL_TYPE="prefork" \
+  # DD_CELERY_WORKER_AUTOSCALE_MIN="2" \
+  # DD_CELERY_WORKER_AUTOSCALE_MAX="8" \
+  # DD_CELERY_WORKER_CONCURRENCY="8" \
+  # DD_CELERY_WORKER_PREFETCH_MULTIPLIER="128" \
+  DD_INITIALIZE=true \
+  DD_UWSGI_MODE="socket" \
+  DD_UWSGI_ENDPOINT="0.0.0.0:3031" \
+  DD_UWSGI_NUM_OF_PROCESSES="2" \
+  DD_UWSGI_NUM_OF_THREADS="2"
+ENTRYPOINT ["/entrypoint-uwsgi.sh"]
+
+FROM django as django-unittests
+COPY unittests/ ./unittests/
